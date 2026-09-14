@@ -1,0 +1,10 @@
+services:
+  news-mcp:
+    build: .
+    image: news-mcp:latest
+    container_name: news-mcp
+    ports:
+      - "50059:50059"
+    environment:
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped

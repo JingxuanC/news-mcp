@@ -1,0 +1,13 @@
+# 运行时产物（不进版本库）
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# 部署时本地覆盖
+.env
+.env.local
