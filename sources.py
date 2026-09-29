@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 from core import RawArticle
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 causal-mcp/1.0"
 TIMEOUT = 15
+# 并行上限：channel/code 级并行用，防止对单站点开过多连接被限流
+MAX_WORKERS = 5
 
 
 def _http_json(url: str, timeout: int = TIMEOUT) -> Any:
@@ -35,28 +38,45 @@ def _http_json(url: str, timeout: int = TIMEOUT) -> Any:
 WALLSTCN_CHANNELS = ["global", "a-stock", "tech", "forex", "commodity"]
 
 
+def _wallstcn_channel(ch: str, limit: int,
+                      fetcher: Callable[[str], Any]) -> list[RawArticle]:
+    """单 channel 抓取；失败返回 []（对齐原串行实现的跳过语义）。"""
+    url = (f"https://api-one.wallstcn.com/apiv1/content/lives"
+           f"?channel={ch}&limit={limit}")
+    try:
+        data = fetcher(url)
+    except Exception:
+        return []
+    out: list[RawArticle] = []
+    for item in (data.get("data", {}).get("items") or []):
+        out.append(RawArticle(
+            source="wallstcn",
+            channel=ch,
+            title=(item.get("title") or item.get("content_text") or "")[:200],
+            content=item.get("content_text") or item.get("content") or "",
+            url=item.get("uri") or "",
+            pub_time=str(item.get("display_time") or ""),
+            external_id=str(item.get("id") or ""),
+        ))
+    return out
+
+
 def fetch_wallstcn(channels: Optional[list[str]] = None,
                    limit: int = 20,
                    fetcher: Callable[[str], Any] = _http_json) -> list[RawArticle]:
-    """对齐 Go WallStCNSource。channel 默认取 5 个（与 athena 的采集面一致）。"""
+    """对齐 Go WallStCNSource。channel 默认取 5 个（与 athena 的采集面一致）。
+
+    channel 之间无依赖，线程池并行抓取（stdlib，不引入第三方依赖）；
+    executor.map 保持 channel 顺序，结果与原串行实现一致。
+    """
+    chs = channels or WALLSTCN_CHANNELS
+    if len(chs) <= 1:
+        return _wallstcn_channel(chs[0], limit, fetcher) if chs else []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(chs))) as ex:
+        parts = ex.map(lambda c: _wallstcn_channel(c, limit, fetcher), chs)
     out: list[RawArticle] = []
-    for ch in (channels or WALLSTCN_CHANNELS):
-        url = (f"https://api-one.wallstcn.com/apiv1/content/lives"
-               f"?channel={ch}&limit={limit}")
-        try:
-            data = fetcher(url)
-        except Exception:
-            continue
-        for item in (data.get("data", {}).get("items") or []):
-            out.append(RawArticle(
-                source="wallstcn",
-                channel=ch,
-                title=(item.get("title") or item.get("content_text") or "")[:200],
-                content=item.get("content_text") or item.get("content") or "",
-                url=item.get("uri") or "",
-                pub_time=str(item.get("display_time") or ""),
-                external_id=str(item.get("id") or ""),
-            ))
+    for part in parts:
+        out.extend(part)
     return out
 
 
@@ -166,29 +186,47 @@ def fetch_hot_rank(date_from: str, date_to: str, page_size: int = 50,
 
 # ── 公告（东财 anotice）───────────────────────────────────────────────
 
+def _notices_for_code(code: str, page_size: int,
+                      fetcher: Callable[[str], Any]) -> list[RawArticle]:
+    """单只股票公告抓取；失败返回 []（对齐原串行实现的跳过语义）。"""
+    bare = code.removeprefix("sh").removeprefix("sz")
+    url = ("https://np-anotice-stock.eastmoney.com/api/security/ann"
+           f"?page_size={page_size}&page_index=1&stock_list={bare}")
+    try:
+        data = fetcher(url)
+    except Exception:
+        return []
+    out: list[RawArticle] = []
+    for it in (((data.get("data") or {}).get("list")) or []):
+        out.append(RawArticle(
+            source="eastmoney_notice",
+            channel="announcement",
+            title=it.get("title") or it.get("art_title") or "",
+            content=it.get("digest") or it.get("title") or "",
+            url=(f"https://np-anotice-stock.eastmoney.com/api/security/ann/detail"
+                 f"?artCode={it.get('art_code')}"),
+            pub_time=str(it.get("notice_date") or ""),
+            external_id=str(it.get("art_code") or ""),
+        ))
+    return out
+
+
 def fetch_notices(codes: list[str], page_size: int = 3,
                   fetcher: Callable[[str], Any] = _http_json) -> list[RawArticle]:
-    """对齐 Go NoticeSource（stock_list 用裸 6 位码）。"""
+    """对齐 Go NoticeSource（stock_list 用裸 6 位码）。
+
+    code 之间无依赖，线程池并行抓取；executor.map 保持传入顺序，
+    结果与原串行实现一致。
+    """
+    if not codes:
+        return []
+    if len(codes) == 1:
+        return _notices_for_code(codes[0], page_size, fetcher)
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(codes))) as ex:
+        parts = ex.map(lambda c: _notices_for_code(c, page_size, fetcher), codes)
     out: list[RawArticle] = []
-    for code in codes:
-        bare = code.removeprefix("sh").removeprefix("sz")
-        url = ("https://np-anotice-stock.eastmoney.com/api/security/ann"
-               f"?page_size={page_size}&page_index=1&stock_list={bare}")
-        try:
-            data = fetcher(url)
-        except Exception:
-            continue
-        for it in (((data.get("data") or {}).get("list")) or []):
-            out.append(RawArticle(
-                source="eastmoney_notice",
-                channel="announcement",
-                title=it.get("title") or it.get("art_title") or "",
-                content=it.get("digest") or it.get("title") or "",
-                url=(f"https://np-anotice-stock.eastmoney.com/api/security/ann/detail"
-                     f"?artCode={it.get('art_code')}"),
-                pub_time=str(it.get("notice_date") or ""),
-                external_id=str(it.get("art_code") or ""),
-            ))
+    for part in parts:
+        out.extend(part)
     return out
 
 
